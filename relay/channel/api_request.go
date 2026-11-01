@@ -1,9 +1,11 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -489,7 +491,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+		status := http.StatusInternalServerError
+		var networkError net.Error
+		if info.RelayFormat == types.RelayFormatTask && (errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout()) {
+			status = http.StatusGatewayTimeout
+		}
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithStatusCode(status), types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")

@@ -1867,3 +1867,71 @@ func TestServeTaskPluginImageProtocolDisconnectDuringSubmissionKeepsDurableSettl
 	assert.False(t, c.Writer.Written())
 	assert.Empty(t, recorder.Body.String())
 }
+
+func TestImageProtocolRendersFinalProviderAfterRetry(t *testing.T) {
+	pinned := imageProtocolTestEndpoint(t)
+	source := strings.ReplaceAll(imageProtocolTestPlugin, "image-bridge", "retried-image")
+	source = strings.ReplaceAll(source, `vendor: "test"`, `vendor: "retried"`)
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	selected := pinned
+	selected.Plugin = plugin
+	c, w := newImageProtocolTestContext("")
+	deps := pluginProtocolTestDeps()
+	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		c.Set(pluginruntime.ContextKeyPinnedEndpoint, selected)
+		outcome := imageProtocolTestOutcome(info, model.TaskStatusSuccess, "https://cdn.example/1.png")
+		outcome.Task.Platform = constant.TaskPlatform(plugin.Meta.Key)
+		return outcome, nil
+	}
+	serveTaskPluginImageProtocol(c, pinned, deps)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "retried", response["vendor"])
+}
+
+func TestMediaSubmissionPreservesUpstreamErrorEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		status              int
+		code, kind, message string
+	}{
+		{400, "invalid_parameter", "invalid_request_error", "Unsupported resolution"},
+		{400, "model_media_mismatch", "invalid_request_error", "Use the video endpoint"},
+		{402, "insufficient_quota", "insufficient_quota", "No subscribed account"},
+		{429, "rate_limit_exceeded", "rate_limit_error", "Please retry later"},
+		{502, "GENERATION_FAILED", "upstream_error", "Generation failed"},
+		{504, "upstream_timeout", "upstream_error", "Generation timed out"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			for _, mode := range []string{"image", "responses", "video"} {
+				c, w := newImageProtocolTestContext("")
+				c.Header("Retry-After", "37")
+				body, err := common.Marshal(map[string]any{"error": map[string]string{"code": tc.code, "type": tc.kind, "message": tc.message}})
+				require.NoError(t, err)
+				taskErr := service.TaskErrorWrapper(errors.New(string(body)), "fail_to_fetch_task", tc.status)
+				if mode == "image" {
+					respondTaskPluginImageError(c, taskErr)
+				} else if mode == "video" {
+					c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Protocol: "openai_video"})
+					respondTaskSubmissionError(c, taskErr)
+				} else {
+					respondPluginProtocolSubmissionError(c, taskErr)
+				}
+				require.Equal(t, tc.status, w.Code)
+				if tc.status == 429 {
+					assert.Equal(t, "37", w.Header().Get("Retry-After"))
+				} else {
+					assert.Empty(t, w.Header().Get("Retry-After"))
+				}
+				var result struct {
+					Error struct{ Code, Type, Message string }
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+				assert.Equal(t, tc.code, result.Error.Code)
+				assert.Equal(t, tc.kind, result.Error.Type)
+				assert.Contains(t, result.Error.Message, tc.message)
+			}
+		})
+	}
+}

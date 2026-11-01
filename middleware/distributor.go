@@ -166,8 +166,9 @@ func channelMatchesExpectedTaskPlugin(c *gin.Context, channel *model.Channel, ex
 		return false
 	}
 	if c != nil {
-		if _, matched := pinnedEndpointCandidateForChannel(c, channel, expected); matched {
-			return true
+		if generation, _ := pinnedCandidatePlugins(c); generation != nil {
+			_, matched := pinnedEndpointCandidateForChannel(c, channel, expected)
+			return matched
 		}
 	}
 	if expected == "" {
@@ -233,12 +234,21 @@ func pinnedEndpointCandidateForChannel(c *gin.Context, channel *model.Channel, e
 	expectedOwned := false
 	selected := -1
 	setting := channel.GetSetting()
+	mappedModel := ""
+	if value, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
+		if pinned, ok := value.(jsplugin.PinnedEndpoint); ok {
+			mappedModel = channel.TaskModelTarget(generation, pinned.Model)
+		}
+	}
 	for index, candidate := range candidates {
 		if candidate == nil {
 			continue
 		}
 		if candidate.Meta.Key == expected {
 			expectedOwned = true
+		}
+		if mappedModel != "" && !slices.Contains(candidate.Meta.Models, mappedModel) {
+			continue
 		}
 		if channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == constant.ChannelTypeNewAPI {
 			// A New API channel may bind several candidates. The first bound

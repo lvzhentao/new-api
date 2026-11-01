@@ -570,24 +570,37 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 }
 
 func lookupTaskPluginEndpoint(generation *pluginruntime.RoutingGeneration, method, path, modelName string) (pluginruntime.PinnedEndpoint, bool) {
-	lookupModel, pinModel, mappedModel := modelName, modelName, ""
+	lookupModel, pinModel := modelName, modelName
 	if declared, ok := generation.CanonicalModel(modelName); ok {
 		lookupModel, pinModel = declared, declared
-	} else if target, ok := model.ResolveTaskModelAlias(generation, modelName); ok {
-		if target.Declared == "" {
-			return pluginruntime.PinnedEndpoint{}, false
-		}
-		lookupModel, pinModel, mappedModel = target.Declared, target.Alias, target.Declared
 	}
 	candidates := generation.LookupEndpointCandidates(method, path, lookupModel)
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		seen[candidate.Plugin.Meta.Key] = true
+	}
+	for _, target := range model.ResolveTaskModelAliasTargets(generation, modelName) {
+		for _, candidate := range generation.LookupEndpointCandidates(method, path, target.Declared) {
+			if seen[candidate.Plugin.Meta.Key] {
+				continue
+			}
+			candidates = append(candidates, candidate)
+			seen[candidate.Plugin.Meta.Key] = true
+			pinModel = target.Alias
+		}
+	}
 	if len(candidates) == 0 {
 		return pluginruntime.PinnedEndpoint{}, false
 	}
+	slices.SortFunc(candidates, func(a, b pluginruntime.ProtocolBinding) int {
+		return strings.Compare(a.Plugin.Meta.Key, b.Plugin.Meta.Key)
+	})
+	mappedModel := ""
+	if target, ok := model.ResolveTaskModelAlias(generation, modelName); ok && target.Alias == pinModel {
+		mappedModel = target.Declared
+	}
 	binding := candidates[0]
-	return pluginruntime.PinnedEndpoint{
-		Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol,
-		Operation: binding.Operation, Model: pinModel, MappedModel: mappedModel, Candidates: candidates,
-	}, true
+	return pluginruntime.PinnedEndpoint{MappedModel: mappedModel, Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: pinModel, Candidates: candidates}, true
 }
 
 // PinTaskPluginEndpoint decides shared-endpoint ownership without executing
@@ -870,6 +883,10 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			candidateContext := protocolContext
 			candidateContext.Protocol = candidate.Protocol
 			candidateContext.Operation = candidate.Operation.Name
+			candidateContext.UpstreamModel = ""
+			if candidate.Model != pinned.Model {
+				candidateContext.UpstreamModel = candidate.Model
+			}
 			// Parsing belongs to durable submission; disconnecting only stops
 			// the later Responses observation.
 			resolvedValue, requestBodyText, callErr := candidate.Plugin.Engine.CallPathWithMemberJSON(
@@ -892,12 +909,15 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			} else if kind, _ := result["kind"].(string); kind != string(pluginruntime.RouteTypeSubmit) {
 				reason = "unsupported_kind"
 				detail = taskPluginInvalidRouteResult
-			} else if model, _ := result["model"].(string); strings.TrimSpace(model) == "" {
+			} else if decodedModel, _ := result["model"].(string); strings.TrimSpace(decodedModel) == "" {
 				reason = "invalid_model"
 				detail = "decoded request is missing a model"
-			} else if model != pinned.Model || (pinned.MappedModel == "" && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
+			} else if decodedModel != pinned.Model {
 				reason = "resolved_model_not_owned"
-				detail = fmt.Sprintf("model %q is not served by this plugin", model)
+				detail = fmt.Sprintf("model %q is not served by this plugin", decodedModel)
+			} else if _, _, owned := model.ResolveTaskPluginModel(pinned.Generation, decodedModel, candidate.Plugin.Meta.Models); !owned {
+				reason = "resolved_model_not_owned"
+				detail = fmt.Sprintf("model %q is not served by this plugin", decodedModel)
 			}
 			if detail != "" {
 				logger.LogWarn(c, common.LogText("task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s err=%q elapsed_ms=%d",

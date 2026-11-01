@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"context"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -625,12 +627,17 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 	for _, tc := range []struct {
 		status   int
 		wantCode string
+		timeout  bool
 	}{
 		{status: http.StatusOK},
 		{status: http.StatusCreated},
 		{status: http.StatusAccepted},
 		{status: http.StatusBadRequest, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusPaymentRequired, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusTooManyRequests, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusGatewayTimeout, wantCode: "fail_to_fetch_task"},
 		{status: http.StatusBadGateway, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusGatewayTimeout, wantCode: "upstream_timeout", timeout: true},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			saveBillingConfig(t)
@@ -640,12 +647,16 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			}))
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
+				if tc.status == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "37")
+				}
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(`{"id":"job-42","message":"upstream body"}`))
 			}))
 			defer server.Close()
 
 			c, info := newTaskSubmitContext(t, "declared-model", "")
+			info.RelayFormat = kittypes.RelayFormatTask
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
 			c.Set("group", "default")
 			info.UserGroup, info.UsingGroup = "default", "default"
@@ -653,13 +664,26 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			// An existing reservation stands in for the wallet so the fixture reaches the upstream call.
 			info.Billing = &imageReservation{limit: 1 << 30}
 			pinMappingOrderPlugin(t, c, source)
+			if tc.timeout {
+				client := service.GetHttpClient()
+				previous := client.Transport
+				transport := http.DefaultTransport.(*http.Transport).Clone()
+				transport.DialContext = func(context.Context, string, string) (net.Conn, error) { return nil, context.DeadlineExceeded }
+				client.Transport = transport
+				t.Cleanup(func() { client.Transport = previous; transport.CloseIdleConnections() })
+			}
 
 			result, taskErr := RelayTaskSubmit(c, info)
 			if tc.wantCode != "" {
 				require.NotNil(t, taskErr)
 				assert.Equal(t, tc.wantCode, taskErr.Code)
 				assert.Equal(t, tc.status, taskErr.StatusCode)
-				assert.Contains(t, taskErr.Message, "upstream body")
+				if tc.status == http.StatusTooManyRequests {
+					assert.Equal(t, "37", c.Writer.Header().Get("Retry-After"))
+				}
+				if !tc.timeout {
+					assert.Contains(t, taskErr.Message, "upstream body")
+				}
 				assert.Nil(t, result)
 				return
 			}

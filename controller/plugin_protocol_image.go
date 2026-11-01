@@ -88,6 +88,12 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 		respondTaskPluginImageError(c, taskErr)
 		return
 	}
+	// 提交重试可切换提供方；成功结果须交给最终选中的插件呈现。
+	if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
+		if selected, ok := value.(pluginruntime.PinnedEndpoint); ok && selected.Plugin != nil {
+			pinned = selected
+		}
+	}
 	if outcome == nil || outcome.Task == nil || outcome.Task.Platform != constant.TaskPlatform(pinned.Plugin.Meta.Key) {
 		logger.LogError(c, common.LogText("task protocol submission returned an invalid durable outcome"))
 		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
@@ -231,6 +237,9 @@ func taskPluginImageResponseFormat(request pluginruntime.ProtocolRequestContext)
 // API. DashScope failure bodies arrive as JSON {code, message}; their message
 // is surfaced so a client sees the vendor reason instead of raw JSON.
 func respondTaskPluginImageError(c *gin.Context, taskErr *dto.TaskError) {
+	if taskErr == nil || taskErr.StatusCode != http.StatusTooManyRequests {
+		c.Writer.Header().Del("Retry-After")
+	}
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	status := http.StatusInternalServerError
 	if taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
@@ -241,8 +250,18 @@ func respondTaskPluginImageError(c *gin.Context, taskErr *dto.TaskError) {
 	var upstream struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		Type    string `json:"type"`
+		Error   *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
 	}
-	if common.UnmarshalJsonStr(message, &upstream) == nil && strings.TrimSpace(upstream.Message) != "" {
+	parsed := common.UnmarshalJsonStr(message, &upstream) == nil
+	if parsed && upstream.Error != nil {
+		upstream.Code, upstream.Message, upstream.Type = upstream.Error.Code, upstream.Error.Message, upstream.Error.Type
+	}
+	if parsed && strings.TrimSpace(upstream.Message) != "" {
 		message = upstream.Message
 		if strings.TrimSpace(upstream.Code) != "" {
 			code = upstream.Code
@@ -251,6 +270,12 @@ func respondTaskPluginImageError(c *gin.Context, taskErr *dto.TaskError) {
 	errorType := "new_api_error"
 	if status < http.StatusInternalServerError {
 		errorType = "invalid_request_error"
+	}
+	if parsed {
+		switch upstream.Type {
+		case "invalid_request_error", "authentication_error", "permission_error", "rate_limit_error", "insufficient_quota", "upstream_error":
+			errorType = upstream.Type
+		}
 	}
 	c.JSON(status, gin.H{"error": gin.H{
 		"message": common.MessageWithRequestId(message, c.GetString(common.RequestIdKey)),

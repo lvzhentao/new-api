@@ -425,6 +425,26 @@ func TestExecuteTaskSubmissionCallerCancellationDuringSubmitRefundsBeforeDurable
 	assert.False(t, c.Writer.Written())
 }
 
+func TestExecuteTaskSubmissionDeadlineRefundsAndReturnsGatewayTimeout(t *testing.T) {
+	events := []string{}
+	setupTaskSubmissionDatabase(t, true, &events)
+	billing := &taskSubmissionTestBilling{events: &events}
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(billing)
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		expired, cancel := context.WithDeadline(c.Request.Context(), time.Unix(1, 0))
+		defer cancel()
+		c.Request = c.Request.WithContext(expired)
+		return nil, service.TaskErrorWrapperLocal(context.DeadlineExceeded, "upstream_timeout", http.StatusGatewayTimeout)
+	})
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, http.StatusGatewayTimeout, taskErr.StatusCode)
+	assert.Equal(t, "upstream_timeout", taskErr.Code)
+	assert.Equal(t, 1, billing.refunds)
+	assert.Equal(t, []string{"refund"}, events)
+}
+
 func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)
@@ -654,6 +674,7 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 
 func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	c := taskSubmissionTestContext()
+	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "status_not_retryable", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: http.StatusPaymentRequired}, 3), "upstream subscription or quota rejection must not be retried")
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -256,7 +257,18 @@ func ListModels(c *gin.Context, modelType int) {
 				continue
 			}
 		}
-		if !acceptUnsetRatioModel && !helper.HasModelBillingConfig(modelName) {
+		configured := acceptUnsetRatioModel || helper.HasModelBillingConfig(modelName)
+		if !configured {
+			for _, target := range model.ResolveTaskModelAliasTargets(jsplugin.DefaultRegistry.Generation(), modelName) {
+				_, override := billing_setting.GetPluginBillingExpr(target.PluginKey, modelName)
+				_, mappedOverride := billing_setting.GetPluginBillingExpr(target.PluginKey, target.Declared)
+				if override || mappedOverride || helper.HasModelBillingConfig(target.Declared) {
+					configured = true
+					break
+				}
+			}
+		}
+		if !configured {
 			continue
 		}
 		userModelNames = append(userModelNames, modelName)

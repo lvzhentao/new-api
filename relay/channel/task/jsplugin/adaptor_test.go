@@ -391,6 +391,26 @@ export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}} expo
 	assert.Contains(t, taskErr.Message, "pinned model")
 }
 
+func TestTaskAdaptorFinalDecoderUsesSelectedChannelModel(t *testing.T) {
+	source := `
+export const meta={apiVersion:1,key:"selected-provider",name:"Selected",version:"1.0.0",author:{name:"Test"},models:["selected/image"],fetchMode:"per_task",protocols:["openai_image"]};
+export const protocols={openai_image:{decodeRequest:ctx=>{if(ctx.upstreamModel!=="selected/image")throw new Error("wrong provider model");return {kind:"submit",model:ctx.model,requestBody:{selected:ctx.upstreamModel}};},render:()=>({})}};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",body:ctx.requestBody}} export function parseSubmitResponse(){return {taskId:"one"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	original := pluginruntime.ProtocolRequestContext{Protocol: "openai_image", Model: "shared-image", UpstreamModel: "previous/image"}
+	c.Set(pluginruntime.ContextKeyProtocolRequest, original)
+	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_image", Model: "shared-image"})
+	info := &relaycommon.RelayInfo{OriginModelName: "shared-image", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "selected/image", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	adaptor := New(plugin)
+	adaptor.Init(info)
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+	assert.Equal(t, "previous/image", c.MustGet(pluginruntime.ContextKeyProtocolRequest).(pluginruntime.ProtocolRequestContext).UpstreamModel, "retry preparation remains immutable")
+}
+
 func TestTaskAdaptorRejectsRendererFromFinalProtocolDecoder(t *testing.T) {
 	source := `
 export const meta = {apiVersion:1,key:"renderer-reject",name:"Renderer Reject",version:"1.0.0",author:{name:"Test"},models:["claimed-model"],fetchMode:"per_task",protocols:[{name:"openai_responses",supports:["sync","background"]}]};

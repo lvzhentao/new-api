@@ -323,6 +323,12 @@ func serveTaskPluginProtocol(
 		respondPluginProtocolSubmissionError(c, taskErr)
 		return
 	}
+	// 提交重试可切换提供方；成功结果须交给最终选中的插件呈现。
+	if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
+		if selected, ok := value.(pluginruntime.PinnedEndpoint); ok && selected.Plugin != nil {
+			pinned = selected
+		}
+	}
 	if outcome == nil || outcome.Task == nil || outcome.RelayInfo == nil ||
 		outcome.Task.UserId != relayInfo.UserId ||
 		outcome.Task.Platform != constant.TaskPlatform(pinned.Plugin.Meta.Key) {
@@ -1234,6 +1240,13 @@ func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStrea
 }
 
 func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError) {
+	if taskErr == nil || taskErr.StatusCode != http.StatusTooManyRequests {
+		c.Writer.Header().Del("Retry-After")
+	}
+	if taskErr != nil && !taskErr.LocalError && taskErr.Code == "fail_to_fetch_task" {
+		respondTaskPluginImageError(c, taskErr)
+		return
+	}
 	status := http.StatusInternalServerError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode

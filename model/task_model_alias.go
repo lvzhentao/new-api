@@ -23,6 +23,7 @@ type taskAliasView struct {
 	generation uint64
 	expiresAt  time.Time
 	byFold     map[string]TaskAliasTarget
+	targets    map[string][]TaskAliasTarget
 }
 
 const taskAliasViewTTL = 60 * time.Second
@@ -47,6 +48,19 @@ func ResolveTaskModelAlias(g *jsplugin.RoutingGeneration, name string) (TaskAlia
 	return target, ok
 }
 
+// ResolveTaskModelAliasTargets preserves the provider-specific targets of a
+// shared alias. Channel selection decides which provider may execute it.
+func ResolveTaskModelAliasTargets(g *jsplugin.RoutingGeneration, name string) []TaskAliasTarget {
+	if g == nil || name == "" {
+		return nil
+	}
+	view := loadFreshTaskAliasView(g)
+	if view == nil {
+		return nil
+	}
+	return slices.Clone(view.targets[jsplugin.ASCIIFold(name)])
+}
+
 // ResolveTaskPluginModel matches a client model name against a plugin's
 // declared models as the host protocols do: a case variant is served under
 // the declared spelling, a channel alias under the alias. declared is the
@@ -55,17 +69,15 @@ func ResolveTaskPluginModel(g *jsplugin.RoutingGeneration, name string, models [
 	if slices.Contains(models, name) {
 		return name, name, true
 	}
-	if canonical, found := g.CanonicalModel(name); found {
-		if !slices.Contains(models, canonical) {
-			return "", "", false
-		}
+	if canonical, found := g.CanonicalModel(name); found && slices.Contains(models, canonical) {
 		return canonical, canonical, true
 	}
-	target, found := ResolveTaskModelAlias(g, name)
-	if !found || target.Declared == "" || !slices.Contains(models, target.Declared) {
-		return "", "", false
+	for _, target := range ResolveTaskModelAliasTargets(g, name) {
+		if slices.Contains(models, target.Declared) {
+			return target.Alias, target.Declared, true
+		}
 	}
-	return target.Alias, target.Declared, true
+	return "", "", false
 }
 
 func loadFreshTaskAliasView(g *jsplugin.RoutingGeneration) *taskAliasView {
@@ -108,6 +120,7 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 		generation: genNum,
 		expiresAt:  time.Now().Add(taskAliasViewTTL),
 		byFold:     make(map[string]TaskAliasTarget),
+		targets:    make(map[string][]TaskAliasTarget),
 	}
 	if DB == nil {
 		return view
@@ -145,9 +158,6 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 			if _, exposed := inModels[alias]; !exposed {
 				continue
 			}
-			if _, declared := generation.CanonicalModel(alias); declared {
-				continue
-			}
 			tail, cyclic := followChannelModelMapping(modelMap, alias)
 			if cyclic {
 				common.SysError(common.LogText("task alias mapping cycle dropped: channel=%d key=%q", channel.Id, alias))
@@ -157,8 +167,8 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 			if !ok {
 				continue
 			}
-			plugin, ok := generation.GetByModel(declared)
-			if !ok {
+			plugins := generation.PluginsByModel(declared)
+			if len(plugins) == 0 {
 				continue
 			}
 			fold := jsplugin.ASCIIFold(alias)
@@ -168,12 +178,14 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 				drafts[fold] = draft
 			}
 			draft.spellings = append(draft.spellings, alias)
-			declareds := draft.byPlugin[plugin.Meta.Key]
-			if declareds == nil {
-				declareds = make(map[string]struct{})
-				draft.byPlugin[plugin.Meta.Key] = declareds
+			for _, plugin := range plugins {
+				declareds := draft.byPlugin[plugin.Meta.Key]
+				if declareds == nil {
+					declareds = make(map[string]struct{})
+					draft.byPlugin[plugin.Meta.Key] = declareds
+				}
+				declareds[declared] = struct{}{}
 			}
-			declareds[declared] = struct{}{}
 		}
 	}
 
@@ -184,14 +196,24 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 				alias = spelling
 			}
 		}
-		if len(draft.byPlugin) != 1 {
-			pluginKeys := make([]string, 0, len(draft.byPlugin))
-			for key := range draft.byPlugin {
-				pluginKeys = append(pluginKeys, key)
+		keys := make([]string, 0, len(draft.byPlugin))
+		for key := range draft.byPlugin {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			declareds := draft.byPlugin[key]
+			if len(declareds) != 1 {
+				continue
 			}
-			common.SysLog(common.LogText("task model alias %q dropped: maps to multiple plugins %v", alias, pluginKeys))
+			for declared := range declareds {
+				view.targets[jsplugin.ASCIIFold(alias)] = append(view.targets[jsplugin.ASCIIFold(alias)], TaskAliasTarget{Alias: alias, Declared: declared, PluginKey: key})
+			}
+		}
+		if len(draft.byPlugin) != 1 {
 			continue
 		}
+
 		var pluginKey, declared string
 		for key, declareds := range draft.byPlugin {
 			pluginKey = key
@@ -230,4 +252,19 @@ func followChannelModelMapping(modelMap map[string]string, start string) (string
 		visited[mapped] = true
 		current = mapped
 	}
+}
+
+// TaskModelTarget returns the declared plugin model selected by this channel's
+// mapping. An unrecognized vendor tail leaves provider selection to the binding.
+func (channel *Channel) TaskModelTarget(g *jsplugin.RoutingGeneration, name string) string {
+	mapping := make(map[string]string)
+	if g == nil || common.UnmarshalJsonStr(channel.GetModelMapping(), &mapping) != nil {
+		return ""
+	}
+	tail, cyclic := followChannelModelMapping(mapping, name)
+	if cyclic {
+		return ""
+	}
+	declared, _ := g.CanonicalModel(tail)
+	return declared
 }

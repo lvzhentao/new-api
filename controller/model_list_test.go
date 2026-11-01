@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -528,4 +529,56 @@ func TestSetupLoginDoesNotTouchPasswordWhenPasswordFieldOmitted(t *testing.T) {
 	var stored model.User
 	require.NoError(t, db.First(&stored, user.Id).Error)
 	assert.Equal(t, hashedPassword, stored.Password)
+}
+
+func TestListModelsIncludesSharedPluginAliasWithMappedPricing(t *testing.T) {
+	withSelfUseModeDisabled(t)
+	withTieredBillingConfig(t, map[string]string{"list-a/image": "tiered_expr", "list-b/image": "tiered_expr"}, map[string]string{"list-a/image": `tier("image", u("image_count") * 0.1)`, "list-b/image": `tier("image", u("image_count") * 0.2)`})
+	db := setupModelListControllerTestDB(t)
+	if dialect := os.Getenv("TEST_TASK_DB_DIALECT"); dialect != "" && dialect != "sqlite" {
+		previousDB, previousLogDB := model.DB, model.LOG_DB
+		previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+		previousMaster := common.IsMasterNode
+		common.IsMasterNode = false
+		t.Setenv("SQL_DSN", os.Getenv("TEST_"+strings.ToUpper(dialect)+"_DSN"))
+		require.NoError(t, model.InitDB())
+		db = model.DB
+		t.Cleanup(func() {
+			model.DB, model.LOG_DB = previousDB, previousLogDB
+			common.SetDatabaseTypes(previousMain, previousLog)
+			common.IsMasterNode = previousMaster
+		})
+	}
+	if os.Getenv("TEST_TASK_DB_DIALECT") != "" && os.Getenv("TEST_TASK_DB_DIALECT") != "sqlite" {
+		require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Migrator().DropTable(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			require.NoError(t, sqlDB.Close())
+		})
+	}
+	for _, key := range []string{"list-a", "list-b"} {
+		source := fmt.Sprintf(`export const meta={apiVersion:1,key:%q,name:"Media",version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",protocols:["openai_image"]};
+  export const protocols={openai_image:{decodeRequest:ctx=>({kind:"submit",model:ctx.model,action:"image",requestBody:ctx.body.value}),render:()=>({})}};
+  export function buildSubmitRequest(){return {url:"https://example.com",body:{}}}
+  export function parseSubmitResponse(){return {taskId:"id"}}
+  export function buildQueryRequest(){return {url:"https://example.com"}}
+  export function parseTaskResult(){return {status:"UNKNOWN"}}`, key, key+"/image")
+		_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+		mapping := fmt.Sprintf(`{"list-shared-image":%q}`, key+"/image")
+		ch := model.Channel{Name: key, Type: constant.ChannelTypeTaskPlugin, Status: 1, Models: "list-shared-image", Group: "default", ModelMapping: &mapping}
+		require.NoError(t, db.Create(&ch).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "list-shared-image", ChannelId: ch.Id, Enabled: true}).Error)
+	}
+	model.InitChannelCache()
+	t.Cleanup(model.InitChannelCache)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenGroup, "default")
+	ListModels(ctx, constant.ChannelTypeOpenAI)
+	require.Contains(t, decodeListModelsResponse(t, recorder), "list-shared-image")
 }

@@ -2672,3 +2672,76 @@ func TestNativeRouteCredentialRewritesOnlyTheVendorsOwnForm(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedMediaAliasesKeepChannelPluginCandidates(t *testing.T) {
+	setupTaskPluginRouteDB(t)
+	if dialect := os.Getenv("TEST_TASK_DB_DIALECT"); dialect != "" && dialect != "sqlite" {
+		previousDB, previousMain, previousLog := model.DB, common.MainDatabaseType(), common.LogDatabaseType()
+		previousMaster := common.IsMasterNode
+		common.IsMasterNode = false
+		t.Setenv("SQL_DSN", os.Getenv("TEST_"+strings.ToUpper(dialect)+"_DSN"))
+		require.NoError(t, model.InitDB())
+		database := model.DB
+		database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "media_alias_" + common.GetUUID() + "_"}
+		t.Cleanup(func() {
+			require.NoError(t, database.Migrator().DropTable(&model.Channel{}, &model.Ability{}))
+			model.DB = previousDB
+			common.SetDatabaseTypes(previousMain, previousLog)
+			common.IsMasterNode = previousMaster
+			sqlDB, err := database.DB()
+			require.NoError(t, err)
+			require.NoError(t, sqlDB.Close())
+		})
+	}
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
+	registry := jsplugin.NewRegistry()
+	for _, key := range []string{"media-a", "media-b"} {
+		source := fmt.Sprintf(`export const meta = {apiVersion:1,key:%q,name:"Media",version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",protocols:["openai_image"]};
+ export const protocols={openai_image:{decodeRequest:ctx=>({kind:"submit",model:ctx.model,action:"image",requestBody:ctx.body.value}),render:()=>({})}};
+ export function buildSubmitRequest(){return {url:"https://example.com",body:{}}}
+ export function parseSubmitResponse(){return {taskId:"id"}}
+ export function buildQueryRequest(){return {url:"https://example.com"}}
+ export function parseTaskResult(){return {status:"UNKNOWN"}}`, key, key+"/image")
+		_, err := registry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		mapping := fmt.Sprintf(`{"shared-image":%q}`, key+"/image")
+		require.NoError(t, model.DB.Create(&model.Channel{Name: key, Type: constant.ChannelTypeTaskPlugin, Status: 1, Models: "shared-image", ModelMapping: &mapping}).Error)
+	}
+	model.InitChannelCache()
+	t.Cleanup(model.InitChannelCache)
+	pinned, ok := lookupTaskPluginEndpoint(registry.Generation(), "POST", "/v1/images/generations", "shared-image")
+	require.True(t, ok)
+	require.Len(t, pinned.Candidates, 2)
+	assert.Equal(t, "shared-image", pinned.Model)
+	assert.Equal(t, "media-a", pinned.Candidates[0].Plugin.Meta.Key)
+	assert.Equal(t, "media-b", pinned.Candidates[1].Plugin.Meta.Key)
+	assert.Empty(t, pinned.MappedModel, "the channel determines the mapped upstream model")
+	router := gin.New()
+	reached := false
+	router.POST("/v1/images/generations", func(c *gin.Context) {
+		c.Set(jsplugin.ContextKeyPinnedEndpoint, pinned)
+		c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: pinned.Generation, Plugin: pinned.Plugin})
+		c.Next()
+	}, PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+		reached = true
+		prepared := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
+		require.Len(t, prepared.Candidates, 2)
+		channel := &model.Channel{Type: constant.ChannelTypeNewAPI, ModelMapping: common.GetPointer(`{"shared-image":"media-b/image"}`)}
+		channel.SetSetting(kitdto.ChannelSettings{TaskExtendPluginKeys: []string{"media-a", "media-b"}})
+		index, matched := pinnedEndpointCandidateForChannel(c, channel, "media-a")
+		require.True(t, matched)
+		assert.Equal(t, 1, index, "channel mapping chooses the provider, not binding order")
+		prepared.Candidates = prepared.Candidates[:1]
+		c.Set(jsplugin.ContextKeyPinnedEndpoint, prepared)
+		assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "media-a"), "a rejected mapped provider must not fall back to another bound provider")
+		c.Status(http.StatusAccepted)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"shared-image","prompt":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+	require.True(t, reached)
+
+}

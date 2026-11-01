@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -528,7 +529,7 @@ func executeTaskSubmissionWith(
 	stage = "before_attempt"
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_attempt", 0)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		return nil, taskRequestContextError(requestErr)
 	}
 
 	retryParam := &service.RetryParam{
@@ -543,7 +544,7 @@ func executeTaskSubmissionWith(
 		stage = "select_channel"
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
-			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+			taskErr = taskRequestContextError(requestErr)
 			break
 		}
 		var channel *model.Channel
@@ -585,7 +586,7 @@ func executeTaskSubmissionWith(
 		result, taskErr = submit(c, relayInfo)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
-			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+			taskErr = taskRequestContextError(requestErr)
 			break
 		}
 		if taskErr == nil {
@@ -629,7 +630,7 @@ func executeTaskSubmissionWith(
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_reserve", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		return nil, taskRequestContextError(requestErr)
 	}
 
 	// Reserve any submit-time upward billing adjustment before persistence.
@@ -653,7 +654,7 @@ func executeTaskSubmissionWith(
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_insert", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		return nil, taskRequestContextError(requestErr)
 	}
 
 	stage = "insert"
@@ -822,6 +823,17 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 }
 
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+	if taskErr == nil || taskErr.StatusCode != http.StatusTooManyRequests {
+		c.Writer.Header().Del("Retry-After")
+	}
+	if !c.Writer.Written() {
+		if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
+			if pinned, ok := value.(pluginruntime.PinnedEndpoint); ok && pinned.Protocol == "openai_video" {
+				respondTaskPluginImageError(c, taskErr)
+				return
+			}
+		}
+	}
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	newTaskPluginSubmitDiagnostics(c).presentError(taskErr)
 	// The client of a relayed event stream already has the vendor's events,
@@ -841,6 +853,14 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 		taskErr.Message = i18n.T(c, i18n.MsgRelayGroupUpstreamSaturated)
 	}
 	c.JSON(taskErr.StatusCode, taskErr)
+}
+
+// taskRequestContextError 区分宿主生成时限与调用方取消，同时保持未落库退款路径一致。
+func taskRequestContextError(err error) *taskdto.TaskError {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return service.TaskErrorWrapperLocal(err, "upstream_timeout", http.StatusGatewayTimeout)
+	}
+	return service.TaskErrorWrapperLocal(err, "request_cancelled", http.StatusRequestTimeout)
 }
 
 // taskSubmissionAPIError adapts a task error for the shared relay error paths.
@@ -881,7 +901,7 @@ func decideTaskRetry(c *gin.Context, taskErr *taskdto.TaskError, retryTimes int)
 			break
 		}
 		return retry
-	case taskErr.StatusCode == http.StatusBadRequest, taskErr.StatusCode == 408:
+	case taskErr.StatusCode == http.StatusBadRequest, taskErr.StatusCode == http.StatusPaymentRequired, taskErr.StatusCode == 408:
 		// azure处理超时不重试
 		stop.Reason = "status_not_retryable"
 	case taskErr.LocalError:
