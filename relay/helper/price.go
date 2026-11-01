@@ -359,7 +359,11 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 			if _, overridden := billing_setting.GetPluginBillingExpr(pluginKey, endpoint.Model); overridden {
 				continue
 			}
-			if _, overridden := billing_setting.GetPluginBillingExpr(pluginKey, endpoint.MappedModel); endpoint.MappedModel != "" && overridden {
+			mappedModel := candidate.Model
+			if mappedModel == "" {
+				mappedModel = endpoint.MappedModel
+			}
+			if _, overridden := billing_setting.GetPluginBillingExpr(pluginKey, mappedModel); mappedModel != "" && overridden {
 				continue
 			}
 			taskBillingModel := endpoint.Model

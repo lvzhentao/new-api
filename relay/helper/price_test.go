@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -802,3 +803,55 @@ func (s *priceTestReservation) GetPreConsumedQuota() int { return s.held }
 func (s *priceTestReservation) Reserve(quota int) error  { s.held = max(s.held, quota); return nil }
 
 func (s *priceTestReservation) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }
+
+func TestSharedGPTImageAliasKeepsMappedPluginPricesIndependent(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error { saved[key] = value; return nil }))
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(saved)) })
+	const ordinaryExpr = `tier("base", p*5 + c*30 + cr*2 + img*8)`
+	const taskExpr = `tier("images", u("image_count") * 0.07)`
+	for _, name := range []string{"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} {
+		for _, isolated := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/isolated=%t", name, isolated), func(t *testing.T) {
+				overrides := map[string]string{"buzzy::buzzy/" + name: taskExpr}
+				if isolated {
+					overrides["flowith::flowith/"+name] = taskExpr
+				}
+				mode, err := common.Marshal(map[string]string{name: "tiered_expr"})
+				require.NoError(t, err)
+				expression, err := common.Marshal(map[string]string{name: ordinaryExpr})
+				require.NoError(t, err)
+				providerPrices, err := common.Marshal(overrides)
+				require.NoError(t, err)
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+					"billing_setting.billing_mode": string(mode), "billing_setting.billing_expr": string(expression),
+					billing_setting.PluginBillingExprOption: string(providerPrices), "group_ratio_setting.group_ratio": `{"default":1}`,
+				}))
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+				c.Request.Header.Set("Accept-Language", "en")
+				c.Set(jsplugin.ContextKeyRelayEndpoint, jsplugin.PinnedEndpoint{Model: name, Candidates: []jsplugin.ProtocolBinding{
+					{Plugin: &jsplugin.LoadedPlugin{Meta: jsplugin.Meta{Key: "buzzy"}}, Model: "buzzy/" + name},
+					{Plugin: &jsplugin.LoadedPlugin{Meta: jsplugin.Meta{Key: "flowith"}}, Model: "flowith/" + name},
+				}})
+				info := &relaycommon.RelayInfo{OriginModelName: name, UserGroup: "default", UsingGroup: "default", RelayFormat: types.RelayFormatOpenAIImage,
+					Request: &dto.ImageRequest{Model: name, N: common.GetPointer(uint(2))}, BillingRequestInput: &billingexpr.RequestInput{}}
+				price, err := ModelPriceHelper(c, info, 1000, &types.TokenCountMeta{})
+				if !isolated {
+					require.ErrorContains(t, err, "flowith", "a provider without its own price must still be rejected")
+					assert.Nil(t, info.TieredBillingSnapshot)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, 2500, price.QuotaToPreConsume, "ordinary GPT pricing must keep its token units")
+				require.NotNil(t, info.TieredBillingSnapshot)
+				assert.Equal(t, ordinaryExpr, info.TieredBillingSnapshot.ExprString)
+				assert.False(t, info.TieredBillingSnapshot.TaskUsageBilling)
+				selected, ok := billing_setting.ResolveTaskBillingExpr("buzzy", name, "buzzy/"+name)
+				assert.True(t, ok)
+				assert.Equal(t, taskExpr, selected, "plugin image pricing must stay independent")
+			})
+		}
+	}
+}
