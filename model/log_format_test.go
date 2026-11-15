@@ -1,7 +1,10 @@
 package model
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -241,4 +244,72 @@ func TestLogFormattingPreservesLargeIntegerLexemes(t *testing.T) {
 		FormatAdminLogs(adminLogs)
 		assert.Equal(t, unprivileged, adminLogs[0].Other)
 	})
+}
+
+func TestSumUsedQuotaDatabaseMatrix(t *testing.T) {
+	previousLogDB := LOG_DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	t.Cleanup(func() {
+		LOG_DB = previousLogDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+		initCol()
+	})
+
+	for _, tc := range []struct {
+		name string
+		env  string
+	}{
+		{name: "sqlite"},
+		{name: "postgres", env: "TEST_POSTGRES_DSN"},
+		{name: "mysql", env: "TEST_MYSQL_DSN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == "" {
+				previousPath := common.SQLitePath
+				common.SQLitePath = filepath.Join(t.TempDir(), "logs.db")
+				t.Cleanup(func() { common.SQLitePath = previousPath })
+				t.Setenv("TEST_LOG_STATS_DSN", "")
+			} else {
+				dsn := os.Getenv(tc.env)
+				if dsn == "" {
+					t.Skip(tc.env + " is not configured")
+				}
+				t.Setenv("TEST_LOG_STATS_DSN", dsn)
+			}
+
+			db, dialect, err := chooseDB("TEST_LOG_STATS_DSN", true)
+			require.NoError(t, err)
+			conn, err := db.DB()
+			require.NoError(t, err)
+			conn.SetMaxOpenConns(1)
+			t.Cleanup(func() { require.NoError(t, conn.Close()) })
+			LOG_DB = db
+			common.SetDatabaseTypes(common.DatabaseTypeSQLite, dialect)
+			initCol()
+
+			versionQuery := "SELECT version()"
+			if tc.env == "" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("%s version: %s", tc.name, version)
+			require.NoError(t, db.Exec("CREATE TEMPORARY TABLE logs (type INTEGER, created_at BIGINT, quota BIGINT, prompt_tokens BIGINT, completion_tokens BIGINT)").Error)
+
+			now := time.Now().Unix()
+			stat, err := SumUsedQuota(LogTypeConsume, now-600, now, "", "", "", 0, "")
+			require.NoError(t, err)
+			assert.Equal(t, Stat{}, stat)
+
+			require.NoError(t, db.Exec("INSERT INTO logs (type, created_at, quota, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
+				LogTypeConsume, now, 1_500_000_000, 1_400_000_000, 100_000_000,
+				LogTypeConsume, now, 1_500_000_000, 1_400_000_000, 100_000_000,
+				LogTypeConsume, now-120, 7, 1, 1,
+				LogTypeError, now, 11, 1, 1,
+			).Error)
+			stat, err = SumUsedQuota(LogTypeConsume, now-600, now, "", "", "", 0, "")
+			require.NoError(t, err)
+			assert.Equal(t, Stat{Quota: 3_000_000_007, Rpm: 2, Tpm: 3_000_000_000}, stat)
+		})
+	}
 }
