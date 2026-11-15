@@ -848,8 +848,9 @@ func TestSharedGPTImageAliasKeepsMappedPluginPricesIndependent(t *testing.T) {
 				require.NotNil(t, info.TieredBillingSnapshot)
 				assert.Equal(t, ordinaryExpr, info.TieredBillingSnapshot.ExprString)
 				assert.False(t, info.TieredBillingSnapshot.TaskUsageBilling)
-				selected, ok := billing_setting.ResolveTaskBillingExpr("buzzy", name, "buzzy/"+name)
+				selected, overridden, ok := billing_setting.ResolveTaskBillingExpr("buzzy", name, "buzzy/"+name)
 				assert.True(t, ok)
+				assert.True(t, overridden)
 				assert.Equal(t, taskExpr, selected, "plugin image pricing must stay independent")
 			})
 		}
