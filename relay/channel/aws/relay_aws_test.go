@@ -150,6 +150,49 @@ func newAwsStreamResponse(request *http.Request, body io.ReadCloser) *http.Respo
 	}
 }
 
+func TestAwsSessionCredentialsAreSigned(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, token string
+		invalid          bool
+	}{
+		{name: "long lived", key: "access-key|secret-key|us-east-1"},
+		{name: "temporary", key: "access-key|secret-key|session-token|us-east-1", token: "session-token"},
+		{name: "missing session token", key: "access-key|secret-key||us-east-1", invalid: true},
+		{name: "blank secret", key: "access-key| |session-token|us-east-1", invalid: true},
+		{name: "missing region", key: "access-key|secret-key|session-token|", invalid: true},
+		{name: "extra field", key: "access-key|secret-key|session-token|us-east-1|extra", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := newAwsTestRelayInfo()
+			info.ApiKey = tc.key
+			client, err := newAwsClient(nil, info)
+			if tc.invalid {
+				require.Error(t, err)
+				assert.NotContains(t, err.Error(), "secret-key")
+				assert.NotContains(t, err.Error(), "session-token")
+				return
+			}
+			require.NoError(t, err)
+			calls := 0
+			_, err = client.InvokeModel(context.Background(), newAwsInvokeModelInput(), func(options *bedrockruntime.Options) {
+				options.Retryer = aws.NopRetryer{}
+				options.HTTPClient = awsHTTPClientFunc(func(request *http.Request) (*http.Response, error) {
+					calls++
+					assert.Equal(t, tc.token, request.Header.Get("X-Amz-Security-Token"))
+					assert.Contains(t, request.Header.Get("Authorization"), "Credential=access-key/")
+					assert.Contains(t, request.Header.Get("Authorization"), "/us-east-1/bedrock/aws4_request")
+					if tc.token != "" {
+						assert.Contains(t, request.Header.Get("Authorization"), "x-amz-security-token")
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+				})
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 1, calls)
+		})
+	}
+}
+
 func TestDoAwsClientRequest_AppliesRuntimeHeaderOverrideToAnthropicBeta(t *testing.T) {
 	t.Parallel()
 
@@ -667,6 +710,8 @@ func TestMantleEndpointAndCredentialValidation(t *testing.T) {
 	}{
 		{name: "regional default", key: "key|us-west-2", want: "https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages"},
 		{name: "proxy root", key: "ak|sk|us-east-1", base: "https://proxy.example/gateway/", want: "https://proxy.example/gateway/anthropic/v1/messages"},
+		{name: "temporary credentials", key: "ak|sk|token|us-east-1", want: "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"},
+		{name: "empty session token", key: "ak|sk||us-east-1", invalid: true},
 		{name: "anthropic root", key: "key|us-east-1", base: "https://proxy.example/anthropic/", want: "https://proxy.example/anthropic/v1/messages"},
 		{name: "version root", key: "key|us-east-1", base: "https://proxy.example/anthropic/v1", want: "https://proxy.example/anthropic/v1/messages"},
 		{name: "full endpoint", key: "key|us-east-1", base: "https://proxy.example/anthropic/v1/messages", want: "https://proxy.example/anthropic/v1/messages"},
@@ -862,10 +907,12 @@ func TestMantleSignatureMatchesWireHeaders(t *testing.T) {
 		name          string
 		http2         bool
 		allHopHeaders bool
+		sessionToken  string
 	}{
 		{name: "HTTP2 keep-alive", http2: true},
 		{name: "HTTP1 hop-by-hop headers", allHopHeaders: true},
 		{name: "HTTP2 hop-by-hop headers", http2: true, allHopHeaders: true},
+		{name: "HTTP2 temporary credentials", http2: true, sessionToken: "session-token"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			type receivedRequest struct {
@@ -889,6 +936,9 @@ func TestMantleSignatureMatchesWireHeaders(t *testing.T) {
 			info := newMantleTestInfo()
 			info.ChannelBaseUrl = server.URL
 			info.ApiKey = "access-key|secret-key|us-east-1"
+			if test.sessionToken != "" {
+				info.ApiKey = "access-key|secret-key|" + test.sessionToken + "|us-east-1"
+			}
 			info.UseRuntimeHeadersOverride = true
 			info.RuntimeHeadersOverride = map[string]any{
 				"Connection":     "keep-alive",
@@ -927,6 +977,7 @@ func TestMantleSignatureMatchesWireHeaders(t *testing.T) {
 			}
 			assert.Equal(t, "test-beta", wire.request.Header.Get("anthropic-beta"))
 			assert.Equal(t, "end-to-end", wire.request.Header.Get("X-Test"))
+			assert.Equal(t, test.sessionToken, wire.request.Header.Get("X-Amz-Security-Token"))
 
 			// Recompute the signature from only the bytes and signed headers that
 			// reached the server, not from the pre-transport request object.
@@ -947,7 +998,7 @@ func TestMantleSignatureMatchesWireHeaders(t *testing.T) {
 			signedAt, err := time.Parse("20060102T150405Z", wire.request.Header.Get("X-Amz-Date"))
 			require.NoError(t, err)
 			hash := sha256.Sum256(wire.body)
-			err = v4.NewSigner().SignHTTP(context.Background(), aws.Credentials{AccessKeyID: "access-key", SecretAccessKey: "secret-key"}, verification, hex.EncodeToString(hash[:]), "bedrock-mantle", "us-east-1", signedAt)
+			err = v4.NewSigner().SignHTTP(context.Background(), aws.Credentials{AccessKeyID: "access-key", SecretAccessKey: "secret-key", SessionToken: test.sessionToken}, verification, hex.EncodeToString(hash[:]), "bedrock-mantle", "us-east-1", signedAt)
 			require.NoError(t, err)
 			assert.Equal(t, authorization, verification.Header.Get("Authorization"))
 		})

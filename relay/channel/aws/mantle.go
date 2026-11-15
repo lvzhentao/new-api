@@ -23,8 +23,8 @@ import (
 
 func mantleRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	parts := strings.Split(info.ApiKey, "|")
-	if len(parts) != 2 && len(parts) != 3 {
-		return "", fmt.Errorf("invalid AWS credentials: use APIKey|Region or AccessKey|SecretAccessKey|Region")
+	if len(parts) != 2 && len(parts) != 3 && len(parts) != 4 {
+		return "", fmt.Errorf("invalid AWS credentials: use APIKey|Region, AccessKey|SecretAccessKey|Region or AccessKey|SecretAccessKey|SessionToken|Region")
 	}
 	for _, part := range parts {
 		if strings.TrimSpace(part) == "" {
@@ -132,14 +132,17 @@ func (a *Adaptor) newMantleRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	} {
 		req.Header.Del(name)
 	}
-	if len(parts) == 3 {
+	if len(parts) >= 3 {
 		// Never send an unrelated bearer credential alongside SigV4. The AWS
 		// signer handles timestamps and signing the exact transmitted payload.
 		req.Header.Del("Authorization")
 		req.Header.Del("x-api-key")
 		credentials := aws.Credentials{AccessKeyID: parts[0], SecretAccessKey: parts[1]}
+		if len(parts) == 4 {
+			credentials.SessionToken = parts[2]
+		}
 		hash := sha256.Sum256(body)
-		if err := v4.NewSigner().SignHTTP(req.Context(), credentials, req, hex.EncodeToString(hash[:]), "bedrock-mantle", parts[2], time.Now()); err != nil {
+		if err := v4.NewSigner().SignHTTP(req.Context(), credentials, req, hex.EncodeToString(hash[:]), "bedrock-mantle", parts[len(parts)-1], time.Now()); err != nil {
 			return nil, fmt.Errorf("sign AWS Mantle request: %w", err)
 		}
 	}

@@ -68,6 +68,11 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 	}
 
 	awsSecret := strings.Split(info.ApiKey, "|")
+	for _, part := range awsSecret {
+		if strings.TrimSpace(part) == "" {
+			return nil, errors.New("invalid aws secret key")
+		}
+	}
 	var client *bedrockruntime.Client
 	switch len(awsSecret) {
 	case 2:
@@ -78,13 +83,17 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 			BearerAuthTokenProvider: bearer.StaticTokenProvider{Token: bearer.Token{Value: apiKey}},
 			HTTPClient:              httpClient,
 		})
-	case 3:
+	case 3, 4:
 		ak := awsSecret[0]
 		sk := awsSecret[1]
-		region := awsSecret[2]
+		region := awsSecret[len(awsSecret)-1]
+		sessionToken := ""
+		if len(awsSecret) == 4 {
+			sessionToken = awsSecret[2]
+		}
 		client = bedrockruntime.New(bedrockruntime.Options{
 			Region:      region,
-			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, "")),
+			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, sessionToken)),
 			HTTPClient:  httpClient,
 		})
 	default:
