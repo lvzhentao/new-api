@@ -143,9 +143,9 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		{48, "xai"},
 	}
 	for _, channelType := range channelTypes {
-		plugin, found := generation.GetByChannelType(channelType.value)
-		require.True(t, found)
-		require.Equal(t, channelType.key, plugin.Meta.Key)
+		plugins := generation.PluginsByChannelType(channelType.value)
+		require.Len(t, plugins, 1, channelType.value)
+		require.Equal(t, channelType.key, plugins[0].Meta.Key)
 	}
 }
 
@@ -161,9 +161,8 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			actualKeys = append(actualKeys, entry.Name())
 		}
 	}
-	// Every other directory holds a request processing plugin, which has no
-	// task part.
-	allKeys := slices.Concat(expectedKeys, slices.Collect(maps.Keys(requestPluginHooks)))
+	// Buzzy and Flowith serve images and videos without a Responses protocol.
+	allKeys := slices.Concat(expectedKeys, []string{"buzzy", "flowith"}, slices.Collect(maps.Keys(requestPluginHooks)))
 	slices.Sort(allKeys)
 	assert.Equal(t, allKeys, actualKeys)
 
