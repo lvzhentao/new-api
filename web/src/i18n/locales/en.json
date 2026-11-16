@@ -933,6 +933,7 @@
     "Batch upstream model update": "Batch upstream model update",
     "Batch upstream model updates applied: {{channels}} channels, {{added}} added, {{removed}} removed, {{fails}} failed": "Batch upstream model updates applied: {{channels}} channels, {{added}} added, {{removed}} removed, {{fails}} failed",
     "Batch-adding Vertex AI keys requires a JSON array, for example {{example}}. Check the input: {{error}}": "Batch-adding Vertex AI keys requires a JSON array, for example {{example}}. Check the input: {{error}}",
+    "Bedrock OpenAI (Chat Completions and Responses)": "Bedrock OpenAI (Chat Completions and Responses)",
     "Before conversion": "Before conversion",
     "Before format conversion": "Before format conversion",
     "Before sending": "Before sending",

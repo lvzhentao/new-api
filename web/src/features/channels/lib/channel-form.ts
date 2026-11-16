@@ -281,7 +281,7 @@ export const channelFormSchema = z
     vertex_project_id: z.string().optional(), // Vertex AI specific (api_key mode only)
     vertex_api_version: z.enum(['v1', 'v1beta1']).optional(), // Vertex AI Google model (Gemini, Imagen) path version
     aws_key_type: z.enum(['ak_sk', 'api_key']).optional(), // AWS specific
-    aws_api_type: z.enum(['invoke_model', 'mantle']).optional(),
+    aws_api_type: z.enum(['invoke_model', 'mantle', 'bedrock_openai']).optional(),
     azure_responses_version: z.string().optional(), // Azure specific
     // Field passthrough controls (stored in settings JSON)
     allow_service_tier: z.boolean().optional(), // OpenAI/Anthropic
@@ -571,7 +571,7 @@ export function transformChannelToFormDefaults(
   let azureResponsesVersion = ''
   let isEnterpriseAccount = false
   let awsKeyType: 'ak_sk' | 'api_key' = 'ak_sk'
-  let awsApiType: 'invoke_model' | 'mantle' = 'invoke_model'
+  let awsApiType: ChannelFormValues['aws_api_type'] = 'invoke_model'
   let allowServiceTier = false
   let disableStore = false
   let allowSafetyIdentifier = false

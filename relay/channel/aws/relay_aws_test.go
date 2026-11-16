@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -35,6 +36,53 @@ import (
 )
 
 const awsTestModel = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+func TestBedrockOpenAIRequestUsesMappedModelAndSignsFinalBody(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mode   int
+		format relaytypes.RelayFormat
+		path   string
+		body   string
+	}{
+		{"chat", relayconstant.RelayModeChatCompletions, relaytypes.RelayFormatOpenAI, "/openai/v1/chat/completions", `{"model":"gpt-6.1-terra","stream":true,"messages":[],"max_tokens":64}`},
+		{"responses", relayconstant.RelayModeResponses, relaytypes.RelayFormatOpenAIResponses, "/openai/v1/responses", `{"model":"gpt-6.1-terra","input":"hello"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := newAwsTestContext(httptest.NewRecorder(), context.Background())
+			info := newAwsTestRelayInfo()
+			info.RelayMode = tc.mode
+			info.RelayFormat = tc.format
+			info.UpstreamModelName = "us.openai.gpt-6.1-terra"
+			info.IsModelMapped = true
+			info.ChannelSetting.PassThroughBodyEnabled = true
+			info.ApiKey = "test-access|test-secret|us-east-1"
+			info.ChannelOtherSettings.AwsApiType = dto.AwsApiTypeBedrockOpenAI
+			info.IsStream = tc.mode == relayconstant.RelayModeChatCompletions
+
+			request, err := newBedrockOpenAIRequest(ctx, info, strings.NewReader(tc.body))
+			require.NoError(t, err)
+			assert.Equal(t, "https://bedrock-runtime.us-east-1.amazonaws.com"+tc.path, request.URL.String())
+			assert.Contains(t, request.Header.Get("Authorization"), "Credential=test-access/")
+			assert.Contains(t, request.Header.Get("Authorization"), "/us-east-1/bedrock/aws4_request")
+			assert.NotContains(t, request.Header.Get("Authorization"), "test-secret")
+
+			body, err := io.ReadAll(request.Body)
+			require.NoError(t, err)
+			var payload map[string]any
+			require.NoError(t, common.Unmarshal(body, &payload))
+			assert.Equal(t, info.UpstreamModelName, payload["model"])
+			assert.NotContains(t, payload, "anthropic_version")
+			if info.IsStream {
+				assert.Equal(t, map[string]any{"include_usage": true}, payload["stream_options"])
+				assert.Equal(t, float64(64), payload["max_completion_tokens"])
+				assert.NotContains(t, payload, "max_tokens")
+			} else {
+				assert.Equal(t, "hello", payload["input"])
+			}
+		})
+	}
+}
 
 type awsHTTPClientFunc func(*http.Request) (*http.Response, error)
 

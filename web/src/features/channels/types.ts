@@ -133,7 +133,7 @@ export interface ChannelOtherSettings {
   vertex_api_version?: 'v1' | 'v1beta1'
   openrouter_enterprise?: boolean
   aws_key_type?: 'ak_sk' | 'api_key'
-  aws_api_type?: 'invoke_model' | 'mantle'
+  aws_api_type?: 'invoke_model' | 'mantle' | 'bedrock_openai'
   allow_service_tier?: boolean
   disable_store?: boolean
   allow_safety_identifier?: boolean

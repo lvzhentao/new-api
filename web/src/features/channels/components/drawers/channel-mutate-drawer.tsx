@@ -3920,6 +3920,10 @@ export function ChannelMutateDrawer({
                           value: 'mantle',
                           label: t('Mantle (Messages API)'),
                         },
+                        {
+                          value: 'bedrock_openai',
+                          label: t('Bedrock OpenAI (Chat Completions and Responses)'),
+                        },
                       ]}
                       onValueChange={field.onChange}
                       value={field.value ?? 'invoke_model'}
@@ -3936,6 +3940,9 @@ export function ChannelMutateDrawer({
                           </SelectItem>
                           <SelectItem value='mantle'>
                             {t('Mantle (Messages API)')}
+                          </SelectItem>
+                          <SelectItem value='bedrock_openai'>
+                            {t('Bedrock OpenAI (Chat Completions and Responses)')}
                           </SelectItem>
                         </SelectGroup>
                       </SelectContent>

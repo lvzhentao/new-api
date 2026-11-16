@@ -109,8 +109,9 @@ const (
 type AwsApiType string
 
 const (
-	AwsApiTypeInvokeModel AwsApiType = "invoke_model"
-	AwsApiTypeMantle      AwsApiType = "mantle"
+	AwsApiTypeInvokeModel   AwsApiType = "invoke_model"
+	AwsApiTypeMantle        AwsApiType = "mantle"
+	AwsApiTypeBedrockOpenAI AwsApiType = "bedrock_openai"
 )
 
 type ChannelOtherSettings struct {

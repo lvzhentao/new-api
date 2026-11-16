@@ -3156,6 +3156,12 @@ test.each([
     next: 'InvokeModel (legacy)',
     value: 'invoke_model',
   },
+  {
+    saved: 'bedrock_openai',
+    shown: 'Bedrock OpenAI (Chat Completions and Responses)',
+    next: 'Mantle (Messages API)',
+    value: 'mantle',
+  },
 ])(
   'AWS API defaults or restores $shown and saves the selected interface',
   async ({ saved, shown, next, value }) => {

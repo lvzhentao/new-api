@@ -933,6 +933,7 @@
     "Batch upstream model update": "Cập nhật mô hình thượng nguồn hàng loạt",
     "Batch upstream model updates applied: {{channels}} channels, {{added}} added, {{removed}} removed, {{fails}} failed": "Đã áp dụng cập nhật hàng loạt mô hình upstream: {{channels}} kênh, {{added}} đã thêm, {{removed}} đã xóa, {{fails}} thất bại",
     "Batch-adding Vertex AI keys requires a JSON array, for example {{example}}. Check the input: {{error}}": "Thêm hàng loạt khóa Vertex AI cần một mảng JSON, ví dụ {{example}}. Hãy kiểm tra dữ liệu nhập: {{error}}",
+    "Bedrock OpenAI (Chat Completions and Responses)": "Bedrock OpenAI (hoàn thành hội thoại và Responses)",
     "Before conversion": "Trước khi chuyển đổi",
     "Before format conversion": "Trước khi chuyển định dạng",
     "Before sending": "Trước khi gửi",

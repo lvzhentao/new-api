@@ -933,6 +933,7 @@
     "Batch upstream model update": "上游模型批量更新",
     "Batch upstream model updates applied: {{channels}} channels, {{added}} added, {{removed}} removed, {{fails}} failed": "已批量处理上游模型更新：渠道 {{channels}} 个，加入 {{added}} 个，删除 {{removed}} 个，失败 {{fails}} 个",
     "Batch-adding Vertex AI keys requires a JSON array, for example {{example}}. Check the input: {{error}}": "批量添加 Vertex AI 必须使用标准的 JSON 数组格式，例如 {{example}}，请检查输入：{{error}}",
+    "Bedrock OpenAI (Chat Completions and Responses)": "Bedrock OpenAI（聊天补全和 Responses）",
     "Before conversion": "迁移前",
     "Before format conversion": "转换格式前",
     "Before sending": "发送前",

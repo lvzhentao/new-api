@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -30,6 +31,9 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeBedrockOpenAI {
+		return nil, errors.New("Bedrock OpenAI mode supports Chat Completions and Responses")
+	}
 	claudeAdaptor := claude.Adaptor{}
 	if _, err := claudeAdaptor.ConvertClaudeRequest(c, info, request); err != nil {
 		return nil, err
@@ -102,6 +106,18 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
+	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeBedrockOpenAI {
+		if request.MaxCompletionTokens == nil {
+			request.MaxCompletionTokens = request.MaxTokens
+		}
+		request.MaxTokens = nil
+		adaptor := openai.Adaptor{}
+		converted, err := adaptor.ConvertOpenAIRequest(c, info, request)
+		if err == nil && info.IsStream {
+			request.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+		}
+		return converted, err
+	}
 	// 检查是否为Nova模型
 	if isNovaModel(request.Model) {
 		novaReq := convertToNovaRequest(request)
@@ -132,12 +148,25 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// TODO implement me
+	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeBedrockOpenAI {
+		adaptor := openai.Adaptor{}
+		return adaptor.ConvertOpenAIResponsesRequest(c, info, request)
+	}
 	return nil, errors.New("not implemented")
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	switch info.ChannelOtherSettings.AwsApiType {
+	case dto.AwsApiTypeBedrockOpenAI:
+		req, err := newBedrockOpenAIRequest(c, info, requestBody)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := channel.DoRequest(c, req, info)
+		if err != nil {
+			return nil, newAwsInvokeError(c.Request.Context(), err, "Bedrock OpenAI")
+		}
+		return resp, nil
 	case dto.AwsApiTypeMantle:
 		req, err := a.newMantleRequest(c, info, requestBody)
 		if err != nil {
@@ -157,6 +186,10 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeBedrockOpenAI {
+		adaptor := openai.Adaptor{}
+		return adaptor.DoResponse(c, resp, info)
+	}
 	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
 		claudeAdaptor := claude.Adaptor{}
 		usage, err = claudeAdaptor.DoResponse(c, resp, info)
