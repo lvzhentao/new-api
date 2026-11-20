@@ -13,6 +13,7 @@ import (
 )
 
 type ChannelSettings struct {
+	FreeZeroOutputStream      bool   `json:"free_zero_output_stream,omitempty"`
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`

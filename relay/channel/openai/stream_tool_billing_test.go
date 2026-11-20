@@ -1,6 +1,8 @@
 package openai
 
 import (
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"strings"
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -35,4 +37,19 @@ func TestObserveStreamChoicesDedupesFunctionCallNames(t *testing.T) {
 	filtered := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
 	observeStreamChoices(filtered, `{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}`, map[string]struct{}{}, &names)
 	assert.True(t, filtered.PerformanceBusinessRejection)
+}
+
+func TestGeminiChatChunksCountOnlyOutput(t *testing.T) {
+	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeGemini}
+	var text strings.Builder
+	var tools int
+	for _, chunk := range []string{
+		`{"choices":[{"delta":{"role":"assistant"}}]}`,
+		`{"choices":[{"delta":{"reasoning_content":"think","content":"answer"}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+	} {
+		require.NoError(t, processTokenData(info, chunk, &text, &tools))
+	}
+	assert.Equal(t, "answerthinklookup{}", text.String())
+	assert.Equal(t, 1, tools)
 }
