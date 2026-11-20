@@ -1,8 +1,11 @@
 package jsplugin
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -11,6 +14,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMediaGatewayExternalFetchOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest string
+		enabled        bool
+		invalid        bool
+	}{
+		{name: "absent"},
+		{name: "disabled", manifest: "allowCredentiallessExternalFetch: false,"},
+		{name: "enabled", manifest: "allowCredentiallessExternalFetch: true,", enabled: true},
+		{name: "string rejected", manifest: `allowCredentiallessExternalFetch: "true",`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin, err := CompilePlugin(routingTestPluginSource("media-opt-in", 0, `["model"]`, tc.manifest, ""), Options{})
+			if tc.invalid {
+				require.ErrorContains(t, err, "allowCredentiallessExternalFetch must be a boolean")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.enabled, plugin.Meta.AllowCredentiallessExternalFetch)
+		})
+	}
+}
 
 func TestMediaGatewayPlugins(t *testing.T) {
 	for _, provider := range []string{"buzzy", "flowith"} {
@@ -275,5 +301,124 @@ func TestMediaGatewayVideoParameters(t *testing.T) {
 		complete, err := plugin.Engine.Call(context.Background(), "extractUsageOnComplete", map[string]any{"action": "video"}, map[string]any{"status": "SUCCESS"}, map[string]any{"data": []any{map[string]any{"url": "https://example.com/a.mp4"}}, "params": map[string]any{"duration": 1}})
 		require.NoError(t, err)
 		assert.Empty(t, complete, "request echoes are not measured duration and must not change the frozen charge")
+	}
+}
+
+func TestBuzzyMotionControlUsesVerifiedFractionalDurationOnce(t *testing.T) {
+	source, err := os.ReadFile("../../plugins/tasks/buzzy/plugin.js")
+	require.NoError(t, err)
+	plugin, err := NewRegistry().Register(string(source), Options{Key: "buzzy", Version: "test"})
+	require.NoError(t, err)
+	assert.True(t, plugin.Meta.AllowCredentiallessExternalFetch)
+
+	video := motionTestMP4(3120, 1000)
+	calls := 0
+	ctx := WithFetcher(context.Background(), motionTestFetcher(video, &calls))
+	request := map[string]any{
+		"model": "motion-alias", "upstreamModel": "buzzy/kling-motion-control", "action": "video",
+		"baseUrl": "https://example.com", "apiKey": "test",
+		"requestBody": map[string]any{
+			"prompt": "follow the reference", "image_urls": []string{"https://cdn.example/person.png"},
+			"video_urls": []string{"https://cdn.example/motion.mp4"},
+		},
+	}
+	value, err := plugin.Engine.Call(ctx, "buildSubmitRequest", request)
+	require.NoError(t, err)
+	built := value.(map[string]any)["body"].(map[string]any)
+	assert.InDelta(t, 3.120, built["duration"], 1e-9)
+	assert.Equal(t, "kling-motion-control", built["model"])
+	assert.Equal(t, 2, calls, "the tail moov box is read with Range requests")
+
+	request["builtRequestBody"] = built
+	usage, err := plugin.Engine.Call(ctx, "extractUsage", request)
+	require.NoError(t, err)
+	assert.InDelta(t, 3.120, usage.(map[string]any)["seconds"], 1e-9)
+	assert.Equal(t, built["duration"], usage.(map[string]any)["seconds"])
+	assert.Equal(t, "720p", usage.(map[string]any)["resolution"])
+	assert.Equal(t, 2, calls, "usage must reuse builtRequestBody instead of probing again")
+}
+
+func TestBuzzyMotionControlRejectsInvalidReferenceVideo(t *testing.T) {
+	source, err := os.ReadFile("../../plugins/tasks/buzzy/plugin.js")
+	require.NoError(t, err)
+	plugin, err := NewRegistry().Register(string(source), Options{Key: "buzzy", Version: "test"})
+	require.NoError(t, err)
+	video := motionTestMP4(3120, 1000)
+
+	for _, tc := range []struct {
+		name      string
+		body      map[string]any
+		duration  uint32
+		wantError string
+	}{
+		{name: "missing", body: map[string]any{"prompt": "test"}, wantError: "requires exactly one reference video"},
+		{name: "multiple", body: map[string]any{"prompt": "test", "video_urls": []string{"https://cdn.example/motion.mp4"}, "reference_videos": []string{"https://cdn.example/other.mp4"}}, wantError: "received 2"},
+		{name: "unreadable", body: map[string]any{"prompt": "test", "video_urls": []string{"https://cdn.example/missing.mp4"}}, wantError: "HTTP 403"},
+		{name: "not MP4", body: map[string]any{"prompt": "test", "video_urls": []string{"https://cdn.example/bad.mp4"}}, wantError: "moov/mvhd duration is missing or invalid"},
+		{name: "missing Content-Range", body: map[string]any{"prompt": "test", "video_urls": []string{"https://cdn.example/bad-range.mp4"}}, wantError: "invalid Content-Range"},
+		{name: "duration exceeds billing limit", body: map[string]any{"prompt": "test", "video_urls": []string{"https://cdn.example/motion.mp4"}}, duration: 3600001, wantError: "reference video exceeds 3600 seconds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := video
+			if tc.duration != 0 {
+				fixture = motionTestMP4(tc.duration, 1000)
+			}
+			ctx := WithFetcher(context.Background(), motionTestFetcher(fixture, &calls))
+			_, err := plugin.Engine.Call(ctx, "buildSubmitRequest", map[string]any{
+				"model": "motion-alias", "upstreamModel": "buzzy/kling-motion-control", "action": "video",
+				"baseUrl": "https://example.com", "apiKey": "test", "requestBody": tc.body,
+			})
+			require.ErrorContains(t, err, tc.wantError)
+		})
+	}
+}
+
+func motionTestMP4(duration, timescale uint32) []byte {
+	box := func(kind string, payload ...[]byte) []byte {
+		body := bytes.Join(payload, nil)
+		header := make([]byte, 8)
+		binary.BigEndian.PutUint32(header, uint32(8+len(body)))
+		copy(header[4:], kind)
+		return append(header, body...)
+	}
+	mvhd := make([]byte, 20)
+	binary.BigEndian.PutUint32(mvhd[12:16], timescale)
+	binary.BigEndian.PutUint32(mvhd[16:20], duration)
+	ftyp := box("ftyp", []byte("isom\x00\x00\x02\x00isomiso2mp41"))
+	// Force a second Range read so the test covers a moov box at the file tail.
+	mdat := box("mdat", make([]byte, 128<<10))
+	return bytes.Join([][]byte{ftyp, mdat, box("moov", box("mvhd", mvhd))}, nil)
+}
+
+func motionTestFetcher(video []byte, calls *int) Fetcher {
+	return func(_ context.Context, request FetchRequest) (FetchResponse, error) {
+		(*calls)++
+		switch request.URL {
+		case "https://cdn.example/missing.mp4":
+			return FetchResponse{Status: http.StatusForbidden}, nil
+		case "https://cdn.example/bad.mp4":
+			return FetchResponse{Status: http.StatusOK, Body: []byte("not an MP4")}, nil
+		case "https://cdn.example/bad-range.mp4":
+			return FetchResponse{Status: http.StatusPartialContent, Body: video[:1024]}, nil
+		case "https://cdn.example/motion.mp4":
+			var start, end int
+			if _, err := fmt.Sscanf(request.Headers["Range"], "bytes=%d-%d", &start, &end); err != nil {
+				return FetchResponse{}, err
+			}
+			if start < 0 || start >= len(video) || end < start {
+				return FetchResponse{Status: http.StatusRequestedRangeNotSatisfiable}, nil
+			}
+			if end >= len(video) {
+				end = len(video) - 1
+			}
+			return FetchResponse{
+				Status:  http.StatusPartialContent,
+				Headers: map[string]string{"Content-Range": fmt.Sprintf("bytes %d-%d/%d", start, end, len(video))},
+				Body:    video[start : end+1],
+			}, nil
+		default:
+			return FetchResponse{Status: http.StatusNotFound}, nil
+		}
 	}
 }

@@ -86,30 +86,35 @@ func (t *LocalizedText) UnmarshalJSON(data []byte) error {
 }
 
 type Meta struct {
-	RequiredCapabilities []string                    `json:"requiredCapabilities,omitempty"`
-	SubmitResponseTypes  []string                    `json:"submitResponseTypes,omitempty"`
-	SortPriority         int                         `json:"sortPriority,omitempty"`
-	Website              string                      `json:"website,omitempty"`
-	APIVersion           int                         `json:"apiVersion"`
-	Key                  string                      `json:"key"`
-	Name                 string                      `json:"name"`
-	NameI18n             LocalizedText               `json:"name_i18n,omitempty"` // the locales of a name given as an object; Name is its en text
-	Icon                 string                      `json:"icon,omitempty"`
-	Description          LocalizedText               `json:"description,omitempty"`
-	Version              string                      `json:"version"`
-	Author               AuthorMeta                  `json:"author"`
-	BaseURL              string                      `json:"baseUrl,omitempty"`
-	ChannelTypes         []int                       `json:"channelTypes,omitempty"`
-	Models               []string                    `json:"models"`
-	FetchMode            string                      `json:"fetchMode"`
-	AllowedHosts         []string                    `json:"allowedHosts"`
-	Upstreams            []string                    `json:"upstreams,omitempty"`
-	Routes               []Route                     `json:"routes"`
-	Protocols            []ProtocolClaim             `json:"protocols"`
-	UsageSchema          map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
-	UsageExamples        []UsageExample              `json:"usageExamples,omitempty"`
-	UsageProfiles        []UsageProfile              `json:"usageProfiles,omitempty"`
-	Auth                 AuthMeta                    `json:"auth"`
+	RequiredCapabilities []string      `json:"requiredCapabilities,omitempty"`
+	SubmitResponseTypes  []string      `json:"submitResponseTypes,omitempty"`
+	SortPriority         int           `json:"sortPriority,omitempty"`
+	Website              string        `json:"website,omitempty"`
+	APIVersion           int           `json:"apiVersion"`
+	Key                  string        `json:"key"`
+	Name                 string        `json:"name"`
+	NameI18n             LocalizedText `json:"name_i18n,omitempty"` // the locales of a name given as an object; Name is its en text
+	Icon                 string        `json:"icon,omitempty"`
+	Description          LocalizedText `json:"description,omitempty"`
+	Version              string        `json:"version"`
+	Author               AuthorMeta    `json:"author"`
+	BaseURL              string        `json:"baseUrl,omitempty"`
+	ChannelTypes         []int         `json:"channelTypes,omitempty"`
+	Models               []string      `json:"models"`
+	FetchMode            string        `json:"fetchMode"`
+	AllowedHosts         []string      `json:"allowedHosts"`
+
+	// AllowCredentiallessExternalFetch permits utils.fetch to public external URLs
+	// without channel credentials. Requests remain subject to SSRF protection.
+	AllowCredentiallessExternalFetch bool `json:"allowCredentiallessExternalFetch,omitempty"`
+
+	Upstreams     []string                    `json:"upstreams,omitempty"`
+	Routes        []Route                     `json:"routes"`
+	Protocols     []ProtocolClaim             `json:"protocols"`
+	UsageSchema   map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
+	UsageExamples []UsageExample              `json:"usageExamples,omitempty"`
+	UsageProfiles []UsageProfile              `json:"usageProfiles,omitempty"`
+	Auth          AuthMeta                    `json:"auth"`
 	// Relay is the provider part: the Advanced Custom routes a type-61
 	// channel bound to the plugin serves.
 	Relay []dto.AdvancedCustomRoute `json:"relay,omitempty"`
@@ -1380,7 +1385,7 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	for field := range object {
 		switch field {
-		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "upstreams", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions", "relay", "configSchema", "optional", "scope", "samples", "channelConfig", "keyHint":
+		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "allowCredentiallessExternalFetch", "upstreams", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions", "relay", "configSchema", "optional", "scope", "samples", "channelConfig", "keyHint":
 		default:
 			return Meta{}, &UnknownMetaFieldError{Field: field}
 		}
@@ -1483,6 +1488,13 @@ func decodeMeta(value any) (Meta, error) {
 	meta.AllowedHosts, err = strictStringSlice(object, "allowedHosts")
 	if err != nil {
 		return Meta{}, err
+	}
+	if raw, exists := object["allowCredentiallessExternalFetch"]; exists {
+		enabled, ok := raw.(bool)
+		if !ok {
+			return Meta{}, fmt.Errorf("plugin meta allowCredentiallessExternalFetch must be a boolean")
+		}
+		meta.AllowCredentiallessExternalFetch = enabled
 	}
 	meta.Upstreams, err = strictStringSlice(object, "upstreams")
 	if err != nil {

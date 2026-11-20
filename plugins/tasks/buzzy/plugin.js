@@ -35,7 +35,7 @@ const IMAGE_MODELS = Object.keys(CATALOG).filter(model => CATALOG[model].kind ==
 const VIDEO_MODELS = Object.keys(CATALOG).filter(model => CATALOG[model].kind === "video").map(model => PROVIDER + "/" + model);
 export const meta = {
   apiVersion: 1, key: PROVIDER, name: PROVIDER === "buzzy" ? "Buzzy Media" : "Flowith Media",
-  version: "1.3.0", author: {name: "klao"}, fetchMode: "per_task",
+  version: "1.3.1", author: {name: "klao"}, fetchMode: "per_task", allowCredentiallessExternalFetch: true,
   description: {en: "Synchronous image and video generation", zh: "同步图片与视频生成"},
   models: IMAGE_MODELS.concat(VIDEO_MODELS),
   protocols: [{name: "openai_image", models: IMAGE_MODELS}, {name: "openai_video", models: VIDEO_MODELS}],
@@ -124,7 +124,7 @@ function normalizeImageResolution(out, model) {
   return resolution === "512" ? "1k" : resolution;
 }
 
-function normalize(body, action, model, finalModel) {
+function normalize(body, action, model, finalModel, verifiedMotionSeconds) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("JSON object required");
   if (body.metadata != null && (typeof body.metadata !== "object" || Array.isArray(body.metadata))) throw new Error("metadata must be an object");
   const out = Object.assign({}, body.metadata || {}, body);
@@ -160,6 +160,8 @@ function normalize(body, action, model, finalModel) {
     const capability = finalModel ? CATALOG[upstreamModel] : undefined;
     for (const field of ["duration", "seconds"]) {
       if (out[field] === undefined) continue;
+      // motion 的 builtRequestBody 已携带 MP4 测得的小数秒，不再按客户端整数参数校验。
+      if (PROVIDER === "buzzy" && upstreamModel === "kling-motion-control" && verifiedMotionSeconds !== undefined) continue;
       const value = out[field];
       if ((typeof value !== "number" && (typeof value !== "string" || !/^[0-9]+$/.test(value))) || !Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > 3600)
         throw new Error(field + " must be a positive integer no greater than 3600; automatic duration is unsupported");
@@ -230,7 +232,8 @@ function normalize(body, action, model, finalModel) {
           count += images.length;
         }
         if (kind === "images" && out.end_frame && count > 2) throw new Error("First/last frame mode does not support additional reference images");
-        if (capability[kind] !== undefined && count > capability[kind]) throw new Error(kind + " exceeds this model's reference limit");
+        const motionVideos = PROVIDER === "buzzy" && upstreamModel === "kling-motion-control" && kind === "videos";
+        if (!motionVideos && capability[kind] !== undefined && count > capability[kind]) throw new Error(kind + " exceeds this model's reference limit");
       }
       const allowed = capability.durations;
       if (duration === undefined) duration = allowed.find(value => value > 0) || capability.min || 5;
@@ -246,8 +249,10 @@ function normalize(body, action, model, finalModel) {
         if (!match) throw new Error("resolution is not supported by this model; omit it for the model default");
         out.resolution = match;
       }
-      // 动作跟随的时长由参考视频决定，接口无成片时长；不能按虚构秒数收费。
-      if (PROVIDER === "buzzy" && upstreamModel === "kling-motion-control") throw new Error("Motion-control billing requires verified reference video duration");
+      // 动作跟随没有独立的成片时长参数：提交与计费都使用参考视频的真实秒数。
+      // buildSubmitRequest 探测一次；extractUsage 通过 builtRequestBody 复用该结果。
+      if (PROVIDER === "buzzy" && upstreamModel === "kling-motion-control")
+        duration = motionControlDuration(out, verifiedMotionSeconds);
     }
     if (duration !== undefined) out.duration = duration;
     delete out.seconds;
@@ -255,6 +260,132 @@ function normalize(body, action, model, finalModel) {
     if (PROVIDER === "buzzy") out.count = 1;
   }
   return out;
+}
+
+const MOTION_PROBE_READ_BYTES = 64 * 1024;
+const MOTION_PROBE_MAX_BYTES = 1024 * 1024; // utils.fetch body limit
+const MOTION_PROBE_MAX_READS = 3; // utils.fetch allows four requests per hook call
+const MAX_MOTION_SECONDS = 3600; // Task usage facts use the host's video duration limit.
+
+function motionControlDuration(out, verifiedMotionSeconds) {
+  if (verifiedMotionSeconds !== undefined) {
+    if (typeof verifiedMotionSeconds !== "number" || !Number.isFinite(verifiedMotionSeconds) || verifiedMotionSeconds <= 0)
+      throw new Error("Motion-control built request has no verified reference video duration");
+    if (verifiedMotionSeconds > MAX_MOTION_SECONDS)
+      throw new Error("Motion-control reference video exceeds " + MAX_MOTION_SECONDS + " seconds");
+    return verifiedMotionSeconds;
+  }
+  const videos = [];
+  for (const field of ["video_urls", "reference_videos"]) {
+    if (Array.isArray(out[field])) videos.push(...out[field]);
+  }
+  if (videos.length === 0) throw new Error("Motion-control requires exactly one reference video");
+  if (videos.length !== 1) throw new Error("Motion-control accepts exactly one reference video; received " + videos.length);
+  let duration;
+  try {
+    duration = readMotionMP4Duration(videos[0]);
+  } catch (error) {
+    throw new Error("Motion-control reference video duration could not be verified: " + error.message);
+  }
+  if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0)
+    throw new Error("Motion-control reference video duration could not be verified: MP4 moov/mvhd duration is missing or invalid");
+  if (duration > MAX_MOTION_SECONDS)
+    throw new Error("Motion-control reference video exceeds " + MAX_MOTION_SECONDS + " seconds");
+  return duration;
+}
+
+// Read [start, start + length) without downloading the whole reference video.
+// A server that ignores Range may answer 200; utils.fetch still caps the body.
+function motionReadBytes(url, start, length) {
+  const response = utils.fetch({url, headers: {Range: "bytes=" + start + "-" + (start + length - 1)}, responseType: "bytes"});
+  if (response.status !== 206 && response.status !== 200) throw new Error("HTTP " + response.status);
+  const bytes = new Uint8Array(response.body);
+  if (response.status === 206) {
+    const range = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/.exec(response.headers["Content-Range"] || "");
+    if (!range || Number(range[1]) !== start || Number(range[2]) !== start + bytes.length - 1 || bytes.length === 0 || bytes.length > length)
+      throw new Error("invalid Content-Range");
+  }
+  return {start: response.status === 206 ? start : 0, bytes};
+}
+
+function motionBE32(bytes, offset) {
+  return bytes[offset] * 16777216 + bytes[offset + 1] * 65536 + bytes[offset + 2] * 256 + bytes[offset + 3];
+}
+
+function motionBE64(bytes, offset) {
+  return motionBE32(bytes, offset) * 4294967296 + motionBE32(bytes, offset + 4);
+}
+
+// ISO BMFF box header: 32-bit size + type, or 64-bit size when size == 1.
+function motionBoxHeader(bytes, offset, end) {
+  if (offset + 8 > end) return null;
+  let size = motionBE32(bytes, offset);
+  let header = 8;
+  if (size === 1) {
+    if (offset + 16 > end) return null;
+    size = motionBE64(bytes, offset + 8);
+    header = 16;
+  }
+  const open = size === 0;
+  if (open) size = end - offset;
+  if (!Number.isSafeInteger(size) || size < header) return null;
+  return {type: String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]), size, header, open};
+}
+
+function readMotionMP4Duration(url) {
+  let reads = 0;
+  let chunk = {start: 0, bytes: new Uint8Array(0)};
+  const read = function (start, length) {
+    if (reads >= MOTION_PROBE_MAX_READS) throw new Error("too many MP4 range reads");
+    if (!Number.isSafeInteger(start + length)) throw new Error("invalid MP4 box offset");
+    reads++;
+    chunk = motionReadBytes(url, start, length);
+  };
+  let offset = 0;
+  for (let i = 0; i < 32; i++) {
+    if (offset < chunk.start || offset + 16 > chunk.start + chunk.bytes.length) read(offset, MOTION_PROBE_READ_BYTES);
+    let local = offset - chunk.start;
+    let box = local >= 0 ? motionBoxHeader(chunk.bytes, local, chunk.bytes.length) : null;
+    if (!box) return null;
+    if (box.type !== "moov") {
+      offset += box.size;
+      continue;
+    }
+    if (box.open || local + box.size > chunk.bytes.length) {
+      read(offset, box.open ? MOTION_PROBE_MAX_BYTES : Math.min(box.size, MOTION_PROBE_MAX_BYTES));
+      local = offset - chunk.start;
+      box = local >= 0 ? motionBoxHeader(chunk.bytes, local, chunk.bytes.length) : null;
+      if (!box) return null;
+    }
+    return motionMoovDuration(chunk.bytes, local + box.header, Math.min(local + box.size, chunk.bytes.length));
+  }
+  return null;
+}
+
+function motionMoovDuration(bytes, start, end) {
+  let offset = start;
+  while (offset < end) {
+    const box = motionBoxHeader(bytes, offset, end);
+    if (!box || offset + box.size > end) return null;
+    if (box.type === "mvhd") return motionMVHDDuration(bytes, offset, box);
+    offset += box.size;
+  }
+  return null;
+}
+
+// mvhd v0 stores 32-bit duration; v1 stores 64-bit duration. Dividing by
+// timescale preserves fractional seconds such as 3120 / 1000 = 3.120.
+function motionMVHDDuration(bytes, offset, box) {
+  const fields = offset + box.header;
+  const version = bytes[fields];
+  const timescaleOffset = fields + (version === 1 ? 20 : 12);
+  const durationOffset = fields + (version === 1 ? 24 : 16);
+  const durationEnd = fields + (version === 1 ? 32 : 20);
+  if ((version !== 0 && version !== 1) || durationEnd > offset + box.size) return null;
+  const timescale = motionBE32(bytes, timescaleOffset);
+  if (!timescale) return null;
+  const duration = version === 1 ? motionBE64(bytes, durationOffset) : motionBE32(bytes, durationOffset);
+  return duration > 0 ? duration / timescale : null;
 }
 
 function decode(ctx, action) {
@@ -288,7 +419,13 @@ export function parseSubmitResponse(ctx, resp) {
 }
 
 export function extractUsage(ctx) {
-  const body = normalize(ctx.requestBody, ctx.action, ctx.upstreamModel || ctx.model, true);
+  const model = ctx.upstreamModel || ctx.model;
+  const upstreamModel = model && model.startsWith(PROVIDER + "/") ? model.slice(PROVIDER.length + 1) : model;
+  const built = ctx.builtRequestBody;
+  const useBuilt = PROVIDER === "buzzy" && upstreamModel === "kling-motion-control" && built && typeof built === "object" && !Array.isArray(built);
+  const source = useBuilt ? built : ctx.requestBody;
+  const verified = useBuilt ? (built.duration === undefined ? null : built.duration) : undefined;
+  const body = normalize(source, ctx.action, model, true, verified);
   if (ctx.action === "image") {
     const resolution = normalizeImageResolution(body, body.model);
     // 旧按张路径只接收数量倍率；枚举只用于表达式计费。

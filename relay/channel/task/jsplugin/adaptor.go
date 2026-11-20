@@ -33,6 +33,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -884,7 +885,98 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 // hookFetcher sends a driver hook's utils.fetch requests to the hosts its
 // request descriptors may use, through the channel's proxy like poll requests.
 func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
-	return service.PluginFetcher(a.plugin, baseURL, proxy, a.channelSetting())
+	fetch := service.PluginFetcher(a.plugin, baseURL, proxy, a.channelSetting())
+	if !a.plugin.Meta.AllowCredentiallessExternalFetch {
+		return fetch
+	}
+	return func(ctx context.Context, request pluginruntime.FetchRequest) (pluginruntime.FetchResponse, error) {
+		if request.Hook != "buildSubmitRequest" {
+			return fetch(ctx, request)
+		}
+		var readsRange bool
+		for name := range request.Headers {
+			if strings.EqualFold(name, "Range") {
+				readsRange = true
+				break
+			}
+		}
+		if err := pluginruntime.ValidateRequestURL(request.URL, baseURL, a.plugin.Meta.AllowedHosts); err == nil && !readsRange {
+			return fetch(ctx, request)
+		}
+		if strings.TrimSpace(proxy) != "" {
+			return pluginruntime.FetchResponse{}, fmt.Errorf("external fetch does not support the channel proxy")
+		}
+		if err := validateCredentiallessExternalFetch(request); err != nil {
+			return pluginruntime.FetchResponse{}, err
+		}
+		client := service.GetSSRFProtectedHTTPClient()
+		if client == nil {
+			return pluginruntime.FetchResponse{}, fmt.Errorf("HTTP client is not initialized")
+		}
+		// A redirect reaches the plugin as it is; fetching its location is a
+		// new request, checked and counted again.
+		noRedirects := *client
+		noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		req, err := http.NewRequestWithContext(ctx, request.Method, request.URL, nil)
+		if err != nil {
+			return pluginruntime.FetchResponse{}, err
+		}
+		// Proxy transport does not use the protected dialer for the destination.
+		if proxyURL, err := http.ProxyFromEnvironment(req); err != nil || proxyURL != nil {
+			return pluginruntime.FetchResponse{}, fmt.Errorf("external fetch requires a direct protected connection")
+		}
+		for name, value := range request.Headers {
+			req.Header.Set(name, value)
+		}
+		started := time.Now()
+		resp, err := noRedirects.Do(req)
+		if err != nil {
+			logger.LogDebug(ctx, "task_plugin subsystem=fetch event=failed plugin=%q hook=%q method=%q host=%q reason=transport_error elapsed_ms=%d",
+				a.plugin.Meta.Key, request.Hook, request.Method, req.URL.Host, time.Since(started).Milliseconds())
+			return pluginruntime.FetchResponse{}, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, pluginruntime.MaxFetchBodyBytes+1))
+		if err != nil {
+			return pluginruntime.FetchResponse{}, err
+		}
+		headers := make(map[string]string, len(resp.Header))
+		for name, values := range resp.Header {
+			if len(values) > 0 {
+				headers[name] = values[0]
+			}
+		}
+		logger.LogDebug(ctx, "task_plugin subsystem=fetch event=done plugin=%q hook=%q method=%q host=%q status=%d bytes=%d elapsed_ms=%d",
+			a.plugin.Meta.Key, request.Hook, request.Method, req.URL.Host, resp.StatusCode, len(body), time.Since(started).Milliseconds())
+		return pluginruntime.FetchResponse{Status: resp.StatusCode, Headers: headers, Body: body}, nil
+	}
+}
+
+// validateCredentiallessExternalFetch applies the media download SSRF policy
+// and restricts requests to credentialless URLs and representation headers.
+func validateCredentiallessExternalFetch(request pluginruntime.FetchRequest) error {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		return fmt.Errorf("external fetch requires GET or HEAD")
+	}
+	setting := system_setting.GetFetchSetting()
+	if !setting.EnableSSRFProtection || setting.AllowPrivateIp || !setting.ApplyIPFilterForDomain {
+		return fmt.Errorf("external fetch requires public-address validation")
+	}
+	parsed, err := url.Parse(request.URL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("external fetch URL must be an absolute HTTP(S) URL")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("external fetch URL userinfo is not allowed")
+	}
+	for name := range request.Headers {
+		switch http.CanonicalHeaderKey(name) {
+		case "Range", "Accept":
+		default:
+			return fmt.Errorf("external fetch header %q is not allowed", name)
+		}
+	}
+	return service.ValidateSSRFProtectedFetchURL(request.URL)
 }
 
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
@@ -1899,6 +1991,11 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 		}
 	}
 	ctx["requestBody"] = requestBody
+	if a.submit != nil {
+		if builtBody, ok := a.submit.Body.(map[string]any); ok {
+			ctx["builtRequestBody"] = builtBody
+		}
+	}
 	ctx["requestHeaders"] = requestHeaders
 	ctx["files"] = files
 	ctx["action"] = info.Action

@@ -667,6 +667,114 @@ export function buildContentRequest(ctx) {
 	assert.ErrorContains(t, err, "utils.fetch is not available in protocols.openai_video.render")
 }
 
+func TestTaskAdaptorHookFetchCredentiallessExternal(t *testing.T) {
+	service.InitHttpClient()
+	protected := service.GetSSRFProtectedHTTPClient()
+	originalClient := *protected
+	fetchSetting := system_setting.GetFetchSetting()
+	originalSetting := *fetchSetting
+	t.Cleanup(func() {
+		*protected = originalClient
+		*fetchSetting = originalSetting
+	})
+	*fetchSetting = system_setting.FetchSetting{EnableSSRFProtection: true, ApplyIPFilterForDomain: true, AllowedPorts: []string{"1-65535"}}
+
+	var sent []*http.Request
+	protected.Transport = taskQueryRoundTripper(func(req *http.Request) (*http.Response, error) {
+		sent = append(sent, req.Clone(req.Context()))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Request:    req,
+		}, nil
+	})
+	optInSource := strings.Replace(mockPlugin, `fetchMode: "per_task",`, `fetchMode: "per_task", allowCredentiallessExternalFetch: true,`, 1)
+	plugin, err := pluginruntime.NewRegistry().Register(optInSource, pluginruntime.Options{})
+	require.NoError(t, err)
+	fetch := New(plugin).hookFetcher("https://channel.example", "")
+	publicRequest := pluginruntime.FetchRequest{
+		Hook: "buildSubmitRequest", Method: http.MethodGet, URL: "https://8.8.8.8/motion.mp4",
+		Headers: map[string]string{"Range": "bytes=0-1023", "Accept": "video/mp4"},
+	}
+
+	t.Run("public URL uses protected client with representation headers", func(t *testing.T) {
+		response, err := fetch(t.Context(), publicRequest)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, response.Status)
+		assert.Equal(t, "ok", string(response.Body))
+		require.Len(t, sent, 1)
+		assert.Equal(t, "bytes=0-1023", sent[0].Header.Get("Range"))
+		assert.Equal(t, "video/mp4", sent[0].Header.Get("Accept"))
+		assert.Empty(t, sent[0].Header.Get("Authorization"))
+	})
+
+	t.Run("credential headers are rejected before transport", func(t *testing.T) {
+		before := len(sent)
+		request := publicRequest
+		request.Headers = map[string]string{"Authorization": "Bearer secret"}
+		_, err := fetch(t.Context(), request)
+		require.ErrorContains(t, err, `external fetch header "Authorization" is not allowed`)
+		assert.Len(t, sent, before)
+	})
+
+	for _, baseURL := range []string{"https://channel.example", "https://8.8.8.8"} {
+		t.Run("configured proxy never falls back to direct fetch "+baseURL, func(t *testing.T) {
+			before := len(sent)
+			_, err := New(plugin).hookFetcher(baseURL, "socks5://127.0.0.1:1")(t.Context(), publicRequest)
+			require.ErrorContains(t, err, "external fetch does not support the channel proxy")
+			assert.Len(t, sent, before)
+		})
+	}
+
+	t.Run("URL userinfo is rejected before transport", func(t *testing.T) {
+		before := len(sent)
+		request := publicRequest
+		request.URL = "https://user:secret@public.example/motion.mp4"
+		_, err := fetch(t.Context(), request)
+		require.ErrorContains(t, err, "external fetch URL userinfo is not allowed")
+		assert.Len(t, sent, before)
+	})
+
+	t.Run("plugin without opt-in keeps original rejection", func(t *testing.T) {
+		before := len(sent)
+		plainPlugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+		require.NoError(t, err)
+		_, err = New(plainPlugin).hookFetcher("https://channel.example", "")(t.Context(), publicRequest)
+		require.ErrorContains(t, err, `plugin request host "8.8.8.8" is not allowed`)
+		assert.Len(t, sent, before)
+	})
+
+	t.Run("private IP remains blocked by SSRF validation", func(t *testing.T) {
+		before := len(sent)
+		request := publicRequest
+		request.URL = "http://127.0.0.1:8080/motion.mp4"
+		_, err := fetch(t.Context(), request)
+		require.ErrorContains(t, err, "private IP address not allowed")
+		assert.Len(t, sent, before)
+	})
+
+	t.Run("range to the channel host still uses public-address validation", func(t *testing.T) {
+		before := len(sent)
+		request := publicRequest
+		request.URL = "http://127.0.0.1:8080/motion.mp4"
+		request.Headers = map[string]string{"range": "bytes=0-1023"}
+		_, err := New(plugin).hookFetcher("http://127.0.0.1:8080", "")(t.Context(), request)
+		require.ErrorContains(t, err, "private IP address not allowed")
+		assert.Len(t, sent, before)
+	})
+
+	t.Run("reject when public address validation is disabled", func(t *testing.T) {
+		previous := *fetchSetting
+		t.Cleanup(func() { *fetchSetting = previous })
+		fetchSetting.AllowPrivateIp = true
+		before := len(sent)
+		_, err := fetch(t.Context(), publicRequest)
+		require.ErrorContains(t, err, "external fetch requires public-address validation")
+		assert.Len(t, sent, before)
+	})
+}
+
 type taskQueryRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f taskQueryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1645,6 +1753,21 @@ func TestSubmitContextExposesClientHeadersWithoutCredentials(t *testing.T) {
 		"X-Trace":                           "first",
 	}, headers)
 	assert.Equal(t, headers, adaptor.submitContext(nil, info)["requestHeaders"], "hooks without a client request see the submission headers")
+}
+
+func TestSubmitContextExposesBuiltRequestBody(t *testing.T) {
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	adaptor.Init(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("task_request", map[string]any{"prompt": "hello"})
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+
+	ctx := adaptor.submitContext(c, info)
+	assert.Equal(t, map[string]any{"prompt": "hello"}, ctx["builtRequestBody"])
 }
 
 func TestSubmitContextNormalizesRequestBodyOnEveryCall(t *testing.T) {
